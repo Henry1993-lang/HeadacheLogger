@@ -23,3 +23,4 @@ pip-delete-this-directory.txt
 
 # Large files
 *.zip
+**/.streamlit/secrets.toml
