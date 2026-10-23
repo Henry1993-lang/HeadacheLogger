@@ -11,6 +11,11 @@ from supabase import create_client, Client
 # --- Constants ---
 CONFIG_FILE = 'config.json'
 API_URL = "https://api.open-meteo.com/v1/forecast"
+# 過去データ用 (1940年〜、直近数日は未反映)
+ARCHIVE_API_URL = "https://archive-api.open-meteo.com/v1/archive"
+# Forecast API で遡れるおおよその日数 (これより古い日付は Archive API を使う)
+FORECAST_PAST_DAYS_LIMIT = 85
+MIN_RECORD_DATE = datetime(1940, 1, 1).date()
 TIMEZONE = "Asia/Tokyo"
 
 # --- Page Configuration ---
@@ -87,23 +92,43 @@ def get_pressure_data(lat, lon, target_dt):
         "end_date": end_date,
         "timezone": TIMEZONE
     }
-    
-    try:
-        response = requests.get(API_URL, params=params)
-        response.raise_for_status()
-        data = response.json()
-    except requests.exceptions.RequestException as e:
-        st.error(f"Weather API Error: {e}")
+
+    # 古い日付は Forecast API の範囲外なので Archive API を優先し、失敗したらもう一方を試す
+    is_old = (datetime.now() - target_dt).days > FORECAST_PAST_DAYS_LIMIT
+    urls = [ARCHIVE_API_URL, API_URL] if is_old else [API_URL, ARCHIVE_API_URL]
+
+    data = None
+    last_error = None
+    for url in urls:
+        try:
+            response = requests.get(url, params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            data = None
+            continue
+        pressures = data.get("hourly", {}).get("surface_pressure") or []
+        if any(p is not None for p in pressures):
+            break
+        data = None
+
+    if data is None:
+        if last_error:
+            st.error(f"Weather API Error: {last_error}")
+        else:
+            st.error("No weather data available.")
         return None
 
-    if "hourly" not in data or not data["hourly"]["time"]:
-        st.error("No weather data available.")
-        return None
-    
     df = pd.DataFrame({
         "time": pd.to_datetime(data["hourly"]["time"]),
         "pressure": data["hourly"]["surface_pressure"]
     })
+    # Archive API は直近数日が欠損 (None) になるため除外
+    df = df.dropna(subset=["pressure"])
+    if df.empty:
+        st.error("No weather data available.")
+        return None
     df.set_index("time", inplace=True)
     return df
 
@@ -337,9 +362,27 @@ def main():
             st.subheader("新規記録")
             
             # Inputs
-            d = st.date_input("日付", datetime.now())
-            t = st.time_input("時間", datetime.now().time())
+            # 初期値は初回だけ設定する (毎回 datetime.now() を渡すと再描画のたびに時刻がリセットされる)
+            now = datetime.now()
+            if 'input_date' not in st.session_state:
+                st.session_state['input_date'] = now.date()
+            if 'input_time' not in st.session_state:
+                st.session_state['input_time'] = now.time().replace(second=0, microsecond=0)
+
+            today = now.date()
+            q1, q2, q3 = st.columns(3)
+            if q1.button("今日", width="stretch"):
+                st.session_state['input_date'] = today
+            if q2.button("昨日", width="stretch"):
+                st.session_state['input_date'] = today - timedelta(days=1)
+            if q3.button("一昨日", width="stretch"):
+                st.session_state['input_date'] = today - timedelta(days=2)
+
+            d = st.date_input("日付", min_value=MIN_RECORD_DATE, max_value=today, key="input_date")
+            t = st.time_input("時間", key="input_time")
             target_dt = datetime.combine(d, t)
+            if target_dt > now:
+                st.warning("未来の日時は記録できません。")
             
             pain_level = st.slider("痛み (0-10)", 0, 10, 5)
             
@@ -351,7 +394,7 @@ def main():
             sel_factors = st.multiselect("要因", config.get("factor_options", []))
             memo = st.text_area("メモ", height=80)
             
-            fetch_btn = st.button("気圧取得 & 分析", type="primary")
+            fetch_btn = st.button("気圧取得 & 分析", type="primary", disabled=target_dt > now)
 
         # Session State for Analysis Result
         if 'analyzed_result' not in st.session_state:
